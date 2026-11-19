@@ -469,6 +469,28 @@ def update_type(type_id: uuid.UUID, payload: TypeNew, request: Request):
     return norm_type(updated)
 
 
+@app.delete('/api/types/{type_id}')
+def delete_type(type_id: uuid.UUID, request: Request):
+    """Eliminar un tipo y su plantilla únicamente si ninguna unidad lo utiliza.
+
+    La FK units.unit_type_id impide el borrado incluso ante peticiones concurrentes.
+    """
+    token, actor = admin(request, mutate=True)
+    original = single('unit_types', token, str(type_id))
+    linked = select('units', token, cols='id', where={'unit_type_id': 'eq.' + str(type_id)}, limit=1)
+    if linked:
+        raise HTTPException(409, 'Este tipo tiene unidades registradas y no se puede eliminar. Puedes editar su código o descripción.')
+    # FK unit_template_items.unit_type_id = ON DELETE CASCADE.
+    # FK units.unit_type_id = NO ACTION: bloquea cualquier carrera.
+    deleted = remote('DELETE', '/unit_types', token,
+                     params={'id': 'eq.' + str(type_id)},
+                     headers={'Prefer': 'return=representation'})
+    if not deleted:
+        raise HTTPException(409, 'No fue posible eliminar el tipo de unidad')
+    audit(token, None, 'eliminacion_tipo', original['code'], actor)
+    return {'ok': True, 'code': original['code']}
+
+
 @app.get('/api/types/{type_id}/template')
 def template(type_id: uuid.UUID, request: Request):
     token, _ = admin(request)
