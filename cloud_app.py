@@ -347,16 +347,25 @@ def norm_person(p):
             'qr_filename': p.get('qr_filename') or p.get('qr_storage_path') or ''}
 
 
-def unit_record(token, unit):
+def unit_record(token, unit, *, batch=None):
+    """Formato de ficha idéntico; batch evita N+1 solicitudes en listados."""
     uid = unit['id']
-    tp = single('unit_types', token, unit['unit_type_id'])
-    all_people = select('responsibles', token)
+    if batch is None:
+        tp = single('unit_types', token, unit['unit_type_id'])
+        all_people = select('responsibles', token)
+        reviews = select('unit_reviews', token, where={'unit_id': 'eq.' + uid}, order='position.asc')
+        photos = select('unit_photos', token, where={'unit_id': 'eq.' + uid}, order='created_at.asc')
+        audit_rows = select('unit_audit', token, where={'unit_id': 'eq.' + uid}, order='created_at.desc', limit=60)
+    else:
+        tp = batch['types'][unit['unit_type_id']]
+        all_people = batch['people']
+        reviews = batch['reviews'].get(uid, [])
+        photos = batch['photos'].get(uid, [])
+        # Los listados nunca incluyen auditoría; se consulta al abrir una ficha.
+        audit_rows = []
     persons = {p['id']: norm_person(p) for p in all_people}
     deliverer = persons.get(unit.get('worker_id'), {})
     receiver = persons.get(unit.get('supervisor_id'), {})
-    reviews = select('unit_reviews', token, where={'unit_id': 'eq.' + uid}, order='position.asc')
-    photos = select('unit_photos', token, where={'unit_id': 'eq.' + uid}, order='created_at.asc')
-    audit_rows = select('unit_audit', token, where={'unit_id': 'eq.' + uid}, order='created_at.desc', limit=60)
     review_view = [{'id': r['id'], 'title': r['label'], 'position': r['position'],
                     'state': r['status']} for r in reviews]
     photo_view = [{'id': p['id'], 'filename': p['storage_path'].split('/')[-1],
@@ -395,8 +404,32 @@ def unit_record(token, unit):
 
 
 def all_units(token):
-    units = select('units', token, order='created_at.desc')
-    return [unit_record(token, u) for u in units]
+    """Carga por lotes, manteniendo autorización RLS en cada consulta."""
+    units = select_all('units', token, order='created_at.desc')
+    if not units:
+        return []
+    types_by_id = {t['id']: t for t in select('unit_types', token)}
+    people_rows = select('responsibles', token)
+    reviews_by_unit = {}
+    for r in select_all('unit_reviews', token, order='position.asc'):
+        reviews_by_unit.setdefault(r['unit_id'], []).append(r)
+    photos_by_unit = {}
+    for photo in select_all('unit_photos', token, order='created_at.asc'):
+        photos_by_unit.setdefault(photo['unit_id'], []).append(photo)
+    batch = {'types': types_by_id, 'people': people_rows,
+             'reviews': reviews_by_unit, 'photos': photos_by_unit}
+    return [unit_record(token, u, batch=batch) for u in units]
+
+
+@app.get('/api/bootstrap')
+def bootstrap(request: Request):
+    """Carga inicial del panel: una sola comprobación Auth/RLS."""
+    token, _ = admin(request)
+    return {
+        'types': [norm_type(t) for t in select('unit_types', token, where={'active': 'eq.true'}, order='code.asc')],
+        'people': [norm_person(p) for p in select('responsibles', token, order='active.desc,full_name.asc')],
+        'units': all_units(token),
+    }
 
 
 @app.get('/api/types')
