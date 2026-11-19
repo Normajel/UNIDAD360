@@ -450,6 +450,25 @@ def create_type(payload: TypeNew, request: Request):
     return {'id': new['id']}
 
 
+@app.put('/api/types/{type_id}')
+def update_type(type_id: uuid.UUID, payload: TypeNew, request: Request):
+    """Corrige código/agrupación conservando el UUID de la plantilla.
+
+    El código es identificador visible histórico: cambia también en listados anteriores.
+    """
+    token, actor = admin(request, mutate=True)
+    code = payload.code.strip().upper()
+    category = payload.category.strip()
+    if not 2 <= len(code) <= 80:
+        raise HTTPException(400, 'Código requerido (2 a 80 caracteres)')
+    original = single('unit_types', token, str(type_id))
+    if original['code'] == code and (original.get('category') or '') == category:
+        return norm_type(original)
+    updated = patch('unit_types', token, str(type_id), {'code': code, 'category': category})
+    audit(token, None, 'edicion_tipo', f"{original['code']} → {code}", actor)
+    return norm_type(updated)
+
+
 @app.get('/api/types/{type_id}/template')
 def template(type_id: uuid.UUID, request: Request):
     token, _ = admin(request)
@@ -775,6 +794,45 @@ def photo_file(photo_id: uuid.UUID, request: Request):
     return Response(data, media_type='image/jpeg', headers={'Cache-Control': 'private, no-store'})
 
 
+def period_performance(records, date_from='', date_to='', type_id=''):
+    """Ingresadas vs recibidas y pendientes al cierre: evita contar recepciones fuera del período.
+
+    Las recepciones del período pueden corresponder a unidades ingresadas antes.
+    El estado al cierre se deriva de fechas registradas, sin alterar registros históricos.
+    """
+    from datetime import date
+    try:
+        start = date.fromisoformat(date_from) if date_from else date.min
+        end = date.fromisoformat(date_to) if date_to else datetime.now(timezone.utc).date()
+    except ValueError as exc:
+        raise HTTPException(400, 'Fechas inválidas: usar AAAA-MM-DD') from exc
+    if start > end:
+        raise HTTPException(400, 'La fecha inicial no puede superar la final')
+    chosen = [r for r in records if not type_id or r['type_id'] == type_id]
+    entered = [r for r in chosen if start <= date.fromisoformat(r['created_at'][:10]) <= end]
+    received = [r for r in chosen if r.get('received_at') and
+                start <= date.fromisoformat(r['received_at'][:10]) <= end]
+    at_cutoff = [r for r in chosen if date.fromisoformat(r['created_at'][:10]) <= end]
+    pending = [r for r in at_cutoff if not r.get('received_at') or date.fromisoformat(r['received_at'][:10]) > end]
+    no_start = [r for r in pending if not r.get('started_at') or date.fromisoformat(r['started_at'][:10]) > end]
+    def snapshot(r):
+        if r.get('received_at') and date.fromisoformat(r['received_at'][:10]) <= end:
+            status = 'finalizada'
+        elif r.get('started_at') and date.fromisoformat(r['started_at'][:10]) <= end:
+            status = 'pendiente'
+        else:
+            status = 'no_iniciada'
+        return {'id': r['id'], 'code': r['code'], 'type_code': r['type_code'],
+                'nv': r.get('nv') or '', 'created_at': r['created_at'],
+                'received_at': r.get('received_at'), 'status_at_cutoff': status,
+                'detail': r['detail']}
+    return {'from': date_from, 'to': end.isoformat(),
+            'entered': len(entered), 'received_in_period': len(received),
+            'pending_at_cutoff': len(pending), 'not_started_at_cutoff': len(no_start),
+            'in_progress_at_cutoff': len(pending) - len(no_start),
+            'units_at_cutoff': [snapshot(r) for r in at_cutoff]}
+
+
 def report_data(token, date_from='', date_to='', type_id='', detail=''):
     all_records = all_units(token)
     rows = [d for d in all_records if (not date_from or d['created_at'][:10] >= date_from)
@@ -799,13 +857,14 @@ def report_data(token, date_from='', date_to='', type_id='', detail=''):
                     'received_at': d['received_at'], 'status': d['status'], 'pending': d['pending'],
                     'vb': d['vb'], 'na': d['na'], 'progress': d['progress'],
                     'deliverer_name': d['deliverer_name'], 'receiver_name': d['receiver_name']})
+    period = period_performance(all_records, date_from, date_to, type_id)
     return {'filters': dict(date_from=date_from, date_to=date_to, type_id=type_id, detail=detail),
             'totals': {'total': len(rows), **counts,
                        'percentage_finalized': round(counts['finalizada'] * 100 / len(rows)) if rows else 0,
                        'pending_checks': sum(d['pending'] for d in rows if not d['received_at']),
                        'awaiting_reception': sum(d['pending'] == 0 and d['started_at'] and not d['received_at'] for d in rows)},
             'by_detail': details, 'by_type': sorted(models.values(), key=lambda x: (-x['total'], x['type_code'])),
-            'by_month': sorted(months.values(), key=lambda x: x['month']), 'units': out}
+            'by_month': sorted(months.values(), key=lambda x: x['month']), 'units': out, 'period': period}
 
 
 @app.get('/api/dashboard/summary')
@@ -923,3 +982,5 @@ def backup(request: Request):
     return Response(result.getvalue(), media_type='application/zip',
                     headers={'Content-Disposition': f'attachment; filename="UNIDAD360_cloud_{stamp}.zip"',
                              'Cache-Control': 'private, no-store'})
+
+# UNIDAD360_OPERACIONES_V4
